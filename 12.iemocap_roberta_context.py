@@ -236,10 +236,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", help="batch ", type=int, default=1)
     parser.add_argument("--dropout", help="dropout", type=float, default=0.2)
     parser.add_argument("--lr", help="learning rate", type=float, default=1e-5)
-    parser.add_argument("--max_ep", help="max epoch", type=int, default=5)
+    parser.add_argument("--max_ep", help="max epoch", type=int, default=30)
     parser.add_argument("--data_name_pattern", help="data_name_pattern", type=str, default="iemocap.{}window2.json")
     parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="roberta-large")
-    parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=0)
+    parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=10)
     options = parser.parse_args()
 
 
