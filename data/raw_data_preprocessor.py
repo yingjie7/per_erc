@@ -24,7 +24,7 @@ def fix_around_window_collect_(around_window = 1, data_name='iemocap'):
 
     for type_data in ["train", "valid", "test"]:
         flatten_data = []
-        file_raw_data = f"all_raw_data/meld.{type_data}.json"
+        file_raw_data = f"data/meld.{type_data}.json"
         data = json.load(open(file_raw_data))
 
         print(len(data))
@@ -48,7 +48,7 @@ def fix_around_window_collect(around_window = 1, data_name='iemocap'):
 
     for type_data in ["train", "valid", "test"]:
         all_data = []
-        file_raw_data = f"all_raw_data/{data_name}.{type_data}.json"
+        file_raw_data = f"data/{data_name}.{type_data}.json"
         data = json.load(open(file_raw_data))
 
         print(len(data))
