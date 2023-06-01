@@ -186,23 +186,43 @@ class EmotionClassifier(pl.LightningModule):
         # 
         #  intra speaker modeling 
         if model_configs.intra_speaker_context:
-            utterance_vector_fused_by_speaker_history = sentence_vectors_with_convers_shape + 0 # for create a new tensor equal to output bert vector`fake_utterance_vector_from_bert`
-            first_user_mask = intra_speaker_masekd_all[:,0]
-            second_user_mask = ~intra_speaker_masekd_all[:, 0]
-            v_first_speaker = sentence_vectors_with_convers_shape[first_user_mask] 
-            v_second_speaker = sentence_vectors_with_convers_shape[second_user_mask]
-            # intra-padding
-            n_utterance_speaker = v_first_speaker.shape[0], v_second_speaker.shape[0]
-            max_n_utterance = max(n_utterance_speaker)
-            if v_first_speaker.shape[0] < v_second_speaker.shape[0]:
-                v_first_speaker = F.pad(v_first_speaker, [0, 0, 0, max_n_utterance-v_first_speaker.shape[0]])
-            else:
-                v_second_speaker = F.pad(v_second_speaker, [0, 0, 0,  max_n_utterance-v_second_speaker.shape[0]])
-            v_all_speakers = torch.stack([v_first_speaker, v_second_speaker], dim=0)
-            h_words = self.intra_speaker_context(v_all_speakers+self.pos_encoding(v_all_speakers)) 
 
-            utterance_vector_fused_by_speaker_history[first_user_mask] += h_words[0][:n_utterance_speaker[0]]
-            utterance_vector_fused_by_speaker_history[second_user_mask] += h_words[1][:n_utterance_speaker[1]]
+            utterance_vector_fused_by_speaker_history = sentence_vectors_with_convers_shape + 0 # for create a new tensor equal to output bert vector`fake_utterance_vector_from_bert
+                                                                                                # original utterance vector list 
+            for i_conversation in range(intra_speaker_masekd_all.shape[0]):
+                # process for each conversation in batch data.
+
+                # compute the intra-masked for each speaker
+                intra_speaker_masked_all_users_one_conversation = torch.unique(intra_speaker_masekd_all[i_conversation], dim=0)
+                n_speaker = intra_speaker_masked_all_users_one_conversation.shape[0]
+
+                # get maximum the number of utterance for each speaker 
+                n_utterance_each_speaker = []
+                v_utterance_each_speaker = []
+                for i_speaker in range(n_speaker):
+                    i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
+                    v_i_speaker = sentence_vectors_with_convers_shape[i_conversation][i_speaker_mask]
+                    n_utterance_each_speaker.append(v_i_speaker.shape[0])
+                    v_utterance_each_speaker.append(v_i_speaker)
+                max_n_utterance_each_speaker = max(n_utterance_each_speaker)
+
+                # intra-padding for each speaker 
+                for i_speaker in range(n_speaker):
+                    if n_utterance_each_speaker[i_speaker] < max_n_utterance_each_speaker:
+                        v_utterance_each_speaker[i_speaker] = F.pad(v_utterance_each_speaker[i_speaker], [0, 0, 0, max_n_utterance_each_speaker-n_utterance_each_speaker[i_speaker]])
+                        
+                tensor_all_speakers = torch.stack(v_utterance_each_speaker, dim=0)
+                
+                # learn intra speaker information based on sequence model 
+                # h_words, (hn, cn) = self.speaker_history_model_by_lstm(v_all_speakers)                                        # for lstm architecture 
+                h_words = self.speaker_history_model_by_lstm(tensor_all_speakers+self.pos_encoding(tensor_all_speakers))        # for transformer architecture 
+
+                # put the intra information back to original utterance vector list 
+
+                for i_speaker in range(n_speaker):
+                    i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
+                    utterance_vector_fused_by_speaker_history[i_conversation][i_speaker_mask] += h_words[i_speaker][:n_utterance_each_speaker[i_speaker]]
+    
             utterance_vector_fused_by_speaker_history = utterance_vector_fused_by_speaker_history.reshape(batch_size*len_longest_conversation, -1)
 
             # combine intra speaker context 
@@ -328,7 +348,7 @@ if __name__ == "__main__":
     # 
     #  init random seed
     set_random_seed(7)
-    data_folder= "data/"
+    data_folder= "/home/phuongnm/deeplearning_tutorial/src/SimpleNN/data/all_raw_data/"
 
     # 
     # Label counting
