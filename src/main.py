@@ -1,3 +1,5 @@
+from os import path
+import os
 import torch
 import numpy as np
 from torch import nn
@@ -334,11 +336,12 @@ class EmotionClassifier(pl.LightningModule):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--batch_size", help="batch ", type=int, default=1)
+    parser.add_argument("--batch_size", help="batch ", type=int, default=1) 
     parser.add_argument("--dropout", help="dropout", type=float, default=0.2)
     parser.add_argument("--lr", help="learning rate", type=float, default=1e-5)
     parser.add_argument("--max_ep", help="max epoch", type=int, default=30)
     parser.add_argument("--data_name_pattern", help="data_name_pattern", type=str, default="iemocap.{}window2.json")
+    parser.add_argument("--log_dir", help="path of data log dir and trained model. This path is augmented by {dataset_name}", type=str, default="./trained_models")
     parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="roberta-large")
     parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=10)
     parser.add_argument("--intra_speaker_context", help="use information of intra speaker context", action="store_true", default=False)
@@ -394,7 +397,12 @@ if __name__ == "__main__":
     print('train size', len(train_loader))
     print('test size',  len(test_loader))
 
-    checkpoint_callback = ModelCheckpoint(dirpath="./", save_top_k=1, 
+    # 
+    # create folder save log data
+    model_configs.log_dir = f"{model_configs.log_dir}/{dataset_name}"
+    if not path.exists(model_configs.log_dir):
+        os.makedirs(model_configs.log_dir)
+    checkpoint_callback = ModelCheckpoint(dirpath=f"{model_configs.log_dir}", save_top_k=1, 
                                         auto_insert_metric_name=True, 
                                         mode="max", 
                                         monitor="valid/f1", 
@@ -408,7 +416,7 @@ if __name__ == "__main__":
     trainer = Trainer(max_epochs=model_configs.max_ep, 
                         accelerator="gpu", devices=1,
                         callbacks=[checkpoint_callback, lr_monitor],
-                        default_root_dir="./", 
+                        default_root_dir=f"{model_configs.log_dir}", 
                         val_check_interval=0.5 if  'dailydialog' not in options.data_name_pattern else 0.1 # 50%/10% epoch - freq time to run evaluate 
                         )
     
