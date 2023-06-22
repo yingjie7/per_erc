@@ -1,0 +1,6 @@
+**.pkl
+**.log
+**.json
+env_py38
+env_py38/
+trained_models/

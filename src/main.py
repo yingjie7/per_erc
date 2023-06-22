@@ -3,17 +3,14 @@ import os
 import torch
 import numpy as np
 from torch import nn
- 
-from torch.utils.data import DataLoader
-import yaml
 
-from transformers import BertConfig, AutoTokenizer, AutoModel, RobertaModel
+from torch.utils.data import DataLoader
+
+from transformers import AutoTokenizer, AutoModel
 import json
 import random
 import argparse
-import torch.nn.functional as F
 from sklearn.metrics import f1_score
-from sklearn.utils import class_weight
 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
@@ -93,6 +90,63 @@ class BatchPreprocessor(object):
         return (contextual_sentences_ids, torch.LongTensor(labels), padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences) 
 
 
+class BertSelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads, dropout, batch_first=True):
+        super(BertSelfAttention, self).__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                "The hidden size (%d) is not a multiple of the number of attention "
+                "heads (%d)" % (hidden_size, num_heads))
+        self.num_attention_heads = num_heads
+        self.attention_head_size = int(hidden_size / num_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(hidden_size, self.all_head_size)
+        self.key = nn.Linear(hidden_size, self.all_head_size)
+        self.value = nn.Linear(hidden_size, self.all_head_size)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, q_input, k_input, v_input, attn_mask=None, key_padding_mask=None):
+        attention_mask_mt = None
+        if attn_mask is not None:
+            attention_mask_mt = torch.zeros(attn_mask.shape, device=attn_mask.device, requires_grad=False)
+            attention_mask_mt.masked_fill_(attn_mask, -9999)
+
+        mixed_query_layer = self.query(q_input)
+        mixed_key_layer = self.key(k_input)
+        mixed_value_layer = self.value(v_input)
+
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        key_layer = self.transpose_for_scores(mixed_key_layer)
+        value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        # Take the dot product between "query" and "key" to get the raw attention scores.
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+        attention_scores = attention_scores + attention_mask_mt.unsqueeze(0) if attention_mask_mt is not None else attention_scores
+
+        # Normalize the attention scores to probabilities.
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.dropout(attention_probs)
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        return context_layer, attention_scores
+    
+
+
 class PositionalEncoding(nn.Module):
     """positional encoding to encode the order of sequence in transformer architecture 
     """
@@ -124,6 +178,8 @@ class EmotionClassifier(pl.LightningModule):
         # init pretrained language model - RoBERTa 
         # froze 10 layers, only train 2 last layer 
         self.model = AutoModel.from_pretrained(model_configs.pre_trained_model_name) #  a pretraied Roberta model
+        for param in self.model.embeddings.parameters():
+            param.requires_grad = False
         for i in range(self.model_configs.froze_bert_layer):
             for param in self.model.encoder.layer[i].parameters():
                 param.requires_grad = False
@@ -138,8 +194,16 @@ class EmotionClassifier(pl.LightningModule):
         
         if model_configs.intra_speaker_context:
             # intra speaker modeling 
-            self.intra_speaker_context  =nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True), num_layers=num_layer)
-            self.output_layer_intra = nn.Linear(d_model, model_configs.num_labels)
+            # self.intra_speaker_context  =nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True), num_layers=num_layer)
+            # self.output_layer_intra = nn.Linear(d_model, model_configs.num_labels)
+
+            self.intra_speaker_modeling =  BertSelfAttention(int(d_model/2), num_heads=nhead, dropout=model_configs.dropout, batch_first=True)    
+            self.iq =   nn.Linear(d_model, int(d_model/2))   
+            self.output_layer_intra = nn.Linear(int(d_model/2), model_configs.num_labels)
+
+            self.inter_speaker_modeling =  BertSelfAttention(int(d_model/2), num_heads=nhead, dropout=model_configs.dropout, batch_first=True)   
+            self.aq =   nn.Linear(d_model, int(d_model/2))  
+            self.output_layer_inter = nn.Linear(int(d_model/2), model_configs.num_labels)
 
         # reduce orverfitting by dropout 
         self.dropout_layer = nn.Dropout(model_configs.dropout)
@@ -154,7 +218,49 @@ class EmotionClassifier(pl.LightningModule):
 
         self.validation_step_outputs = []
         self.test_step_outputs = []
-        
+        self.predict_step_outputs = []
+
+        # aggregate_sentence_h_state
+        if self.model_configs.sent_aggregate_method == 'mlp':
+            self.sentence_modeling = nn.Linear(d_model,d_model)
+            self.sentence_tanh = nn.Tanh()
+        if self.model_configs.sent_aggregate_method == 'lstm': 
+            self.sentence_lstm = nn.LSTM(input_size=d_model, hidden_size=d_model//2, num_layers=2, 
+                    dropout=0.2, batch_first=True, bidirectional=True)
+
+    def aggregate_sentence_h_state(self, cls_hidden_state, h_words_hidden_states, cur_sentence_indexes_masked):
+        if self.model_configs.sent_aggregate_method == 'average':  
+            # using average word representations instead of CLS token for sentence/utterance representation. For example:
+            # input:
+            #   - bert_out[0]: is hidden vector of all words of current sentence and local context, arround sentences (2 context sentences befor + 2 next sentences)  
+            #   - cur_sentence_indexes_masked: is a masked of the words is in current sentence. 
+            #       - for example: [False, False, True, True, True, False, False, False, False] => current sentence contains words: 2 3 4, and other words (words 0, 1, 5, 6, 7, 8) is the context 
+            # output requirements: 
+            #   - sentence_vectors: is the average of word vectors in curent sentence, for example: = 1/3 * (w2 + w3 + w4)
+            
+            sentence_vectors = torch.sum(h_words_hidden_states*cur_sentence_indexes_masked.unsqueeze(-1), dim=1) * (1/ torch.sum(cur_sentence_indexes_masked, dim=1)).unsqueeze(-1) 
+            return sentence_vectors
+        elif self.model_configs.sent_aggregate_method == 'mlp':      
+            # 
+            # using average word representations + a linear layer + a tanh activation: 
+            # h_words => average => linear => tanh
+            # CODE HERE to compute the Linear layer over average of words.
+            sentence_vectors_avg = torch.sum(h_words_hidden_states*cur_sentence_indexes_masked.unsqueeze(-1), dim=1) * (1/ torch.sum(cur_sentence_indexes_masked, dim=1)).unsqueeze(-1) 
+            sentence_vectors_output = self.sentence_modeling(sentence_vectors_avg)
+            sentence_vectors = self.sentence_tanh(sentence_vectors_output)
+            return sentence_vectors
+        elif self.model_configs.sent_aggregate_method == 'lstm':      
+            # 
+            # using LSTM for modeling sentence vector based on word vectors 
+            h_words, (hn, cn) = self.sentence_lstm(h_words_hidden_states*cur_sentence_indexes_masked.unsqueeze(-1))
+            sentence_vectors = torch.sum(h_words*cur_sentence_indexes_masked.unsqueeze(-1), dim=1) * (1/ torch.sum(cur_sentence_indexes_masked, dim=1)).unsqueeze(-1) 
+
+            return sentence_vectors
+        elif self.model_configs.sent_aggregate_method == 'cls':      
+            # using CLS token hidden state for sentence vector representation 
+            # h_cls
+            sentence_vectors = cls_hidden_state
+            return sentence_vectors
 
     def training_step(self, batch, batch_idx, return_y_hat=False):
         input_ids, labels, padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences = batch
@@ -165,19 +271,14 @@ class EmotionClassifier(pl.LightningModule):
         # bert_out[0]: hidden states of `all words` for each sentence 
         # bert_out[1]: hidden states of `cls token` for each sentence
         bert_out = self.model(**input_ids)
-        h_words_hidden_states = bert_out[0]
 
         # 
-        # using average word representations instead of CLS token for sentence/utterance representation. For example:
-        # input:
-        #   - bert_out[0]: is hidden vector of all words of current sentence and local context, arround sentences (2 context sentences befor + 2 next sentences)  
-        #   - cur_sentence_indexes_masked: is a masked of the words is in current sentence. 
-        #       - for example: [False, False, True, True, True, False, False, False, False] => current sentence contains words: 2 3 4, and other words (words 0, 1, 5, 6, 7, 8) is the context 
-        # output requirements: 
-        #   - sentence_vectors: is the average of word vectors in curent sentence, for example: = 1/3 * (w2 + w3 + w4)
-        sentence_vectors = torch.sum(h_words_hidden_states*cur_sentence_indexes_masked.unsqueeze(-1), dim=1) * (1/ torch.sum(cur_sentence_indexes_masked, dim=1)).unsqueeze(-1) 
+        # construct sentence vector based on word representations  
+        sentence_vectors = self.aggregate_sentence_h_state(bert_out.pooler_output, bert_out.last_hidden_state, cur_sentence_indexes_masked)
         sentence_vectors_with_convers_shape = sentence_vectors.reshape(n_conversation, len_longest_conversation, -1)
 
+        # 
+        # learn global relationship 
         u_vector_fused_by_context = self.context_modeling(sentence_vectors_with_convers_shape +  self.pos_encoding(sentence_vectors_with_convers_shape), src_key_padding_mask=padding_utterance_masked)
         u_vector_fused_by_context = u_vector_fused_by_context.reshape(n_conversation*len_longest_conversation, -1)
         
@@ -189,46 +290,58 @@ class EmotionClassifier(pl.LightningModule):
         #  intra speaker modeling 
         if model_configs.intra_speaker_context:
 
-            utterance_vector_fused_by_speaker_history = sentence_vectors_with_convers_shape + 0 # for create a new tensor equal to output bert vector`fake_utterance_vector_from_bert
-                                                                                                # original utterance vector list 
-            for i_conversation in range(intra_speaker_masekd_all.shape[0]):
-                # process for each conversation in batch data.
+            i_vector = self.iq(sentence_vectors_with_convers_shape)
+            u_vector_fused_by_intra_speaker, _ = self.intra_speaker_modeling(i_vector,  i_vector,  i_vector, 
+                                                                        attn_mask=(~intra_speaker_masekd_all).repeat(8,1,1), key_padding_mask=padding_utterance_masked) 
+            u_vector_fused_by_intra_speaker = u_vector_fused_by_intra_speaker.reshape(n_conversation*len_longest_conversation, -1)
 
-                # compute the intra-masked for each speaker
-                intra_speaker_masked_all_users_one_conversation = torch.unique(intra_speaker_masekd_all[i_conversation], dim=0)
-                n_speaker = intra_speaker_masked_all_users_one_conversation.shape[0]
+            a_vector = self.aq(sentence_vectors_with_convers_shape)
+            u_vector_fused_by_inter_speaker, _ = self.inter_speaker_modeling(a_vector,  a_vector,  a_vector, 
+                                                                        attn_mask=intra_speaker_masekd_all.repeat(8,1,1), key_padding_mask=padding_utterance_masked)
+            u_vector_fused_by_inter_speaker = u_vector_fused_by_inter_speaker.reshape(n_conversation*len_longest_conversation, -1)
+            
+            y_hat = y_hat + self.output_layer_intra(self.dropout_layer(u_vector_fused_by_intra_speaker)) + self.output_layer_inter(self.dropout_layer(u_vector_fused_by_inter_speaker))
 
-                # get maximum the number of utterance for each speaker 
-                n_utterance_each_speaker = []
-                v_utterance_each_speaker = []
-                for i_speaker in range(n_speaker):
-                    i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
-                    v_i_speaker = sentence_vectors_with_convers_shape[i_conversation][i_speaker_mask]
-                    n_utterance_each_speaker.append(v_i_speaker.shape[0])
-                    v_utterance_each_speaker.append(v_i_speaker)
-                max_n_utterance_each_speaker = max(n_utterance_each_speaker)
+            # utterance_vector_fused_by_speaker_history = sentence_vectors_with_convers_shape + 0 # for create a new tensor equal to output bert vector`fake_utterance_vector_from_bert
+            #                                                                                     # original utterance vector list 
+            # for i_conversation in range(intra_speaker_masekd_all.shape[0]):
+            #     # process for each conversation in batch data.
 
-                # intra-padding for each speaker 
-                for i_speaker in range(n_speaker):
-                    if n_utterance_each_speaker[i_speaker] < max_n_utterance_each_speaker:
-                        v_utterance_each_speaker[i_speaker] = F.pad(v_utterance_each_speaker[i_speaker], [0, 0, 0, max_n_utterance_each_speaker-n_utterance_each_speaker[i_speaker]])
+            #     # compute the intra-masked for each speaker
+            #     intra_speaker_masked_all_users_one_conversation = torch.unique(intra_speaker_masekd_all[i_conversation], dim=0)
+            #     n_speaker = intra_speaker_masked_all_users_one_conversation.shape[0]
+
+            #     # get maximum the number of utterance for each speaker 
+            #     n_utterance_each_speaker = []
+            #     v_utterance_each_speaker = []
+            #     for i_speaker in range(n_speaker):
+            #         i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
+            #         v_i_speaker = sentence_vectors_with_convers_shape[i_conversation][i_speaker_mask]
+            #         n_utterance_each_speaker.append(v_i_speaker.shape[0])
+            #         v_utterance_each_speaker.append(v_i_speaker)
+            #     max_n_utterance_each_speaker = max(n_utterance_each_speaker)
+
+            #     # intra-padding for each speaker 
+            #     for i_speaker in range(n_speaker):
+            #         if n_utterance_each_speaker[i_speaker] < max_n_utterance_each_speaker:
+            #             v_utterance_each_speaker[i_speaker] = F.pad(v_utterance_each_speaker[i_speaker], [0, 0, 0, max_n_utterance_each_speaker-n_utterance_each_speaker[i_speaker]])
                         
-                tensor_all_speakers = torch.stack(v_utterance_each_speaker, dim=0)
+            #     tensor_all_speakers = torch.stack(v_utterance_each_speaker, dim=0)
                 
-                # learn intra speaker information based on sequence model 
-                # h_words, (hn, cn) = self.speaker_history_model_by_lstm(v_all_speakers)                                        # for lstm architecture 
-                h_words = self.speaker_history_model_by_lstm(tensor_all_speakers+self.pos_encoding(tensor_all_speakers))        # for transformer architecture 
+            #     # learn intra speaker information based on sequence model 
+            #     # h_words, (hn, cn) = self.speaker_history_model_by_lstm(v_all_speakers)                                        # for lstm architecture 
+            #     h_words = self.intra_speaker_context(tensor_all_speakers+self.pos_encoding(tensor_all_speakers))         # for transformer architecture 
 
-                # put the intra information back to original utterance vector list 
+            #     # put the intra information back to original utterance vector list 
 
-                for i_speaker in range(n_speaker):
-                    i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
-                    utterance_vector_fused_by_speaker_history[i_conversation][i_speaker_mask] += h_words[i_speaker][:n_utterance_each_speaker[i_speaker]]
+            #     for i_speaker in range(n_speaker):
+            #         i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
+            #         utterance_vector_fused_by_speaker_history[i_conversation][i_speaker_mask] += h_words[i_speaker][:n_utterance_each_speaker[i_speaker]]
     
-            utterance_vector_fused_by_speaker_history = utterance_vector_fused_by_speaker_history.reshape(batch_size*len_longest_conversation, -1)
+            # utterance_vector_fused_by_speaker_history = utterance_vector_fused_by_speaker_history.reshape(batch_size*len_longest_conversation, -1)
 
             # combine intra speaker context 
-            y_hat = y_hat + self.output_layer_intra(self.dropout_layer(utterance_vector_fused_by_speaker_history))
+            # y_hat = y_hat + self.output_layer_intra(self.dropout_layer(utterance_vector_fused_by_speaker_history))
 
         # 
         # compute probabilities and loss 
@@ -248,10 +361,11 @@ class EmotionClassifier(pl.LightningModule):
         return out
     
     def validation_step(self, batch, batch_idx):
-        v_multi_conversation, labels, padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences = batch
+        _, labels, _, _, _, _ = batch
         loss, y_hat = self.training_step(batch, batch_idx, return_y_hat=True)
-        predictions = torch.argmax(y_hat, dim=1)
+        _ = torch.argmax(y_hat, dim=1)
 
+        loss, y_hat, labels = loss.detach().cpu(), y_hat.detach().cpu(), labels.detach().cpu()
         self.validation_step_outputs.append({'val_loss_step': loss, 'y_hat': y_hat, 'labels': labels})
         self.log('valid/loss', loss)
 
@@ -287,14 +401,14 @@ class EmotionClassifier(pl.LightningModule):
         return f1_weighted*100
     
     def on_validation_epoch_end(self):
-        valid_f1 = self._eval_epoch_end(self.validation_step_outputs)
-        self.log('valid/f1', valid_f1, prog_bar=True)
-        self.log('hp_metric', valid_f1)
+        f_val = self._eval_epoch_end(self.validation_step_outputs)
+        self.log_dict({'valid/f1': f_val, 'hp_metric': f_val}, 
+                    prog_bar=True, sync_dist=True)
         self.validation_step_outputs.clear()
     def on_test_epoch_end(self):
-        test_val = self._eval_epoch_end(self.test_step_outputs)
-        self.log('test/f1', test_val, prog_bar=True)
-        self.log('hp_metric', test_val)
+        f_val = self._eval_epoch_end(self.test_step_outputs)
+        self.log_dict({'test/f1': f_val, 'hp_metric': f_val}, 
+                    prog_bar=True, sync_dist=True)
         self.test_step_outputs.clear()
 
     def configure_optimizers(self):
@@ -336,13 +450,18 @@ class EmotionClassifier(pl.LightningModule):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--data_folder", help="path to data folder", type=str, default='/home/phuongnm/deeplearning_tutorial/src/SimpleNN/data/all_raw_data/') 
+    parser.add_argument("--n_best_checkpoint", help="number of best checkpoints to save", type=int, default=1) 
+    parser.add_argument("--accumulate_grad_batches", help="number of accumulate batch for each grandient update step", type=int, default=2) 
+    parser.add_argument("--seed", help="seed value ", type=int, default=7) 
     parser.add_argument("--batch_size", help="batch ", type=int, default=1) 
     parser.add_argument("--dropout", help="dropout", type=float, default=0.2)
     parser.add_argument("--lr", help="learning rate", type=float, default=1e-5)
     parser.add_argument("--max_ep", help="max epoch", type=int, default=30)
+    parser.add_argument("--sent_aggregate_method", help="sent_aggregate_method in  {average, cls, lstm, mlp}", type=str, default="average")
     parser.add_argument("--data_name_pattern", help="data_name_pattern", type=str, default="iemocap.{}window2.json")
     parser.add_argument("--log_dir", help="path of data log dir and trained model. This path is augmented by {dataset_name}", type=str, default="./trained_models")
-    parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="roberta-large")
+    parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="cardiffnlp/twitter-roberta-base-sentiment")
     parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=10)
     parser.add_argument("--intra_speaker_context", help="use information of intra speaker context", action="store_true", default=False)
     options = parser.parse_args()
@@ -350,14 +469,13 @@ if __name__ == "__main__":
 
     # 
     #  init random seed
-    set_random_seed(7)
-    data_folder= "/home/phuongnm/deeplearning_tutorial/src/SimpleNN/data/all_raw_data/"
+    set_random_seed(options.seed)
 
     # 
     # Label counting
     dataset_name = options.data_name_pattern.split(".")[0]
     data_name_pattern = options.data_name_pattern
-    train_data = json.load(open(f'{data_folder}/{data_name_pattern.format("train")}'))
+    train_data = json.load(open(f'{options.data_folder}/{data_name_pattern.format("train")}'))
     all_labels = []
     for sample in train_data:
         all_labels+=  sample['labels']
@@ -384,9 +502,9 @@ if __name__ == "__main__":
     batch_size = options.batch_size
     bert_tokenizer = AutoTokenizer.from_pretrained(model_configs.pre_trained_model_name)
     data_loader = BatchPreprocessor(bert_tokenizer)
-    train_loader = DataLoader(json.load(open(f"{data_folder}/{data_name_pattern.format('train')}")), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=True)
-    valid_loader = DataLoader(json.load(open(f"{data_folder}/{data_name_pattern.format('valid')}")), batch_size=1, collate_fn=data_loader, shuffle=True)
-    test_loader = DataLoader(json.load(open(f"{data_folder}/{data_name_pattern.format('test')}")), batch_size=1, collate_fn=data_loader, shuffle=True)
+    train_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('train')}")), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=True)
+    valid_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('valid')}")), batch_size=1, collate_fn=data_loader, shuffle=False)
+    test_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('test')}")), batch_size=1, collate_fn=data_loader, shuffle=False)
 
     for e in test_loader:
         print('First epoch data:')
@@ -402,7 +520,7 @@ if __name__ == "__main__":
     model_configs.log_dir = f"{model_configs.log_dir}/{dataset_name}"
     if not path.exists(model_configs.log_dir):
         os.makedirs(model_configs.log_dir)
-    checkpoint_callback = ModelCheckpoint(dirpath=f"{model_configs.log_dir}", save_top_k=1, 
+    checkpoint_callback = ModelCheckpoint(dirpath=f"{model_configs.log_dir}", save_top_k=model_configs.n_best_checkpoint, 
                                         auto_insert_metric_name=True, 
                                         mode="max", 
                                         monitor="valid/f1", 
@@ -416,7 +534,8 @@ if __name__ == "__main__":
     trainer = Trainer(max_epochs=model_configs.max_ep, 
                         accelerator="gpu", devices=1,
                         callbacks=[checkpoint_callback, lr_monitor],
-                        default_root_dir=f"{model_configs.log_dir}", 
+                        default_root_dir=f"{model_configs.log_dir}",
+                        accumulate_grad_batches=model_configs.accumulate_grad_batches,
                         val_check_interval=0.5 if  'dailydialog' not in options.data_name_pattern else 0.1 # 50%/10% epoch - freq time to run evaluate 
                         )
     
