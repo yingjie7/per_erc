@@ -5,3 +5,5 @@ torchtext
 ipywidgets
 tensorboard
 tensorboardX
+transformers
+scikit-learn
