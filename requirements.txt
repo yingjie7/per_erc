@@ -7,3 +7,4 @@ tensorboard
 tensorboardX
 transformers
 scikit-learn
+accelerate

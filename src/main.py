@@ -5,7 +5,6 @@ import numpy as np
 from torch import nn
 
 from torch.utils.data import DataLoader
-
 from transformers import AutoTokenizer, AutoModel
 import json
 import random
@@ -30,13 +29,55 @@ def set_random_seed(seed: int):
     torch.backends.cudnn.benchmark = False
     
 class BatchPreprocessor(object): 
-    def __init__(self, tokenizer) -> None:
+    def __init__(self, tokenizer, dataset_name=None, window_ct=2) -> None:
         self.tokenizer = tokenizer
         self.separate_token_id = self.tokenizer.convert_tokens_to_ids("</s>")
-    # def _encoding(self, sentences):
-    #     input_ids = self.tokenizer(sentences,  padding='max_length', max_length=512, truncation=True, return_tensors='pt')
-    #     sentence_vectors = self.fine_tuned_model.model(**input_ids)[1] # get CLS of all sentences
-    #     return sentence_vectors
+        self.dataset_name  = dataset_name
+        self.window_ct = window_ct
+    
+    @staticmethod
+    def load_raw_data(path_data):
+        raw_data = json.load(open(path_data))
+        if isinstance(raw_data, dict):
+            new_data_list = []
+            for k, v in raw_data.items():
+                v['s_id'] = k
+                new_data_list.append(v)
+            return new_data_list
+        elif isinstance(raw_data, list):
+            return raw_data
+            
+    
+    @staticmethod
+    def get_speaker_name(s_id, gender, data_name):
+        if data_name == "iemocap":
+            speaker = {
+                        "Ses01": {"F": "Mary", "M": "James"},
+                        "Ses02": {"F": "Patricia", "M": "John"},
+                        "Ses03": {"F": "Jennifer", "M": "Robert"},
+                        "Ses04": {"F": "Linda", "M": "Michael"},
+                        "Ses05": {"F": "Elizabeth", "M": "William"},
+                    }
+            s_id_first_part = s_id[:5]
+            return speaker[s_id_first_part][gender].upper()
+        elif data_name in ['meld', "emorynlp"]:
+            gender_idx = gender.index(1) 
+            return f"SPEAKER_{gender_idx}"
+        elif data_name=='dailydialog':
+            return f"SPEAKER_{gender}"
+        
+    def sentence_mixed_by_surrounding(self, sentences, around_window, s_id, genders, data_name):
+        new_sentences = []
+        for i, cur_sent in enumerate(sentences):
+            tmp_s = ""
+            for j in range(max(0, i-around_window), min(len(sentences), i+around_window+1)):
+                if i == j:
+                    tmp_s += " </s>"
+                tmp_s +=  f" {self.get_speaker_name(s_id, genders[j], data_name=data_name)}: {sentences[j]}"
+                if i == j:
+                    tmp_s += " </s>"
+            new_sentences.append(tmp_s)
+        return new_sentences
     
     def __call__(self, batch):
         raw_sentences = []
@@ -44,7 +85,7 @@ class BatchPreprocessor(object):
         labels = []
 
         # masked tensor  
-        lengths = [len(sample['sentences_mixed_around']) for sample in batch]
+        lengths = [len(sample['sentences']) for sample in batch]
         max_len_conversation = max(lengths)
         padding_utterance_masked = torch.BoolTensor([[False]*l_i+ [True]*(max_len_conversation - l_i) for l_i in lengths])
 
@@ -52,8 +93,14 @@ class BatchPreprocessor(object):
         # - intra speaker
         intra_speaker_masekd_all = torch.BoolTensor(len(batch), max_len_conversation,max_len_conversation)
         for i, sample in enumerate(batch):
+            sentences_mixed_arround = self.sentence_mixed_by_surrounding(sample['sentences'], 
+                                                                        around_window=self.window_ct, 
+                                                                        s_id=sample['s_id'], 
+                                                                        genders=sample['genders'],
+                                                                        data_name=self.dataset_name)
+        
             # conversation padding 
-            padded_conversation = sample['sentences_mixed_around'] + ["<pad_sentence>"]* (max_len_conversation - lengths[i])
+            padded_conversation = sentences_mixed_arround + ["<pad_sentence>"]* (max_len_conversation - lengths[i])
             raw_sentences.append(padded_conversation)
             raw_sentences_flatten += padded_conversation
 
@@ -61,9 +108,9 @@ class BatchPreprocessor(object):
             labels += [int(label) for label in sample['labels']] + [-1]* (max_len_conversation - lengths[i])
 
             # speaker
-            intra_speaker_masekd= torch.BoolTensor(len(padded_conversation),len(padded_conversation))
-            for j in  range(len(padded_conversation)):
-                for k in  range(len(padded_conversation)):
+            intra_speaker_masekd= torch.BoolTensor(len(padded_conversation),len(padded_conversation)).fill_(False)
+            for j in  range(len( sample['genders'])):
+                for k in  range(len( sample['genders'])):
                     gender_j = sample['genders'][j]
                     gender_k = sample['genders'][k]
 
@@ -80,11 +127,18 @@ class BatchPreprocessor(object):
         # utterance vectorizer
         # v_single_sentences = self._encoding(sample['sentences'])
         contextual_sentences_ids = self.tokenizer(raw_sentences_flatten,  padding='longest', max_length=512, truncation=True, return_tensors='pt')
-        cur_sentence_indexes = (contextual_sentences_ids['input_ids'] == self.separate_token_id).nonzero(as_tuple=True)[1].reshape(contextual_sentences_ids['input_ids'].shape[0], -1)[:, :2]
+        sent_indices, word_indices = torch.where(contextual_sentences_ids['input_ids'] == self.separate_token_id)
+        gr_sent_indices = [[] for e in range(len(raw_sentences_flatten))]
+        for sent_idx, w_idx in zip (sent_indices, word_indices):
+            gr_sent_indices[sent_idx].append(w_idx.item())
+            
         cur_sentence_indexes_masked = torch.BoolTensor(contextual_sentences_ids['input_ids'].shape).fill_(False)
         for i in range(contextual_sentences_ids['input_ids'].shape[0]):
+            if raw_sentences_flatten[i] =='<pad_sentence>':
+                cur_sentence_indexes_masked[i][gr_sent_indices[i][0]] = True
+                continue
             for j in range(contextual_sentences_ids['input_ids'].shape[1]):
-                if  cur_sentence_indexes[i][0] <= j <= cur_sentence_indexes[i][1]:
+                if  gr_sent_indices[i][0] <= j <= gr_sent_indices[i][1]:
                     cur_sentence_indexes_masked[i][j] = True
 
         return (contextual_sentences_ids, torch.LongTensor(labels), padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences) 
@@ -130,7 +184,7 @@ class BertSelfAttention(nn.Module):
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-        attention_scores = attention_scores + attention_mask_mt.unsqueeze(0) if attention_mask_mt is not None else attention_scores
+        attention_scores = attention_scores + attention_mask_mt.unsqueeze(0).reshape(attention_scores.shape) if attention_mask_mt is not None else attention_scores
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -290,58 +344,29 @@ class EmotionClassifier(pl.LightningModule):
         #  intra speaker modeling 
         if model_configs.intra_speaker_context:
 
-            i_vector = self.iq(sentence_vectors_with_convers_shape)
+            # padding for masked utterance
+            new_padding_utterance_masked = padding_utterance_masked.unsqueeze(-1).repeat(1,1,intra_speaker_masekd_all.shape[-1])
+            new_padding_utterance_masked.fill_(False)
+            for i_batch in range(padding_utterance_masked.shape[0]):
+                count_masked_utterance = sum(padding_utterance_masked[i_batch])
+                if count_masked_utterance > 0:
+                    new_padding_utterance_masked[i_batch, -count_masked_utterance:, -count_masked_utterance:]= True
+            
+            inter_speaker_masekd_all = ((~intra_speaker_masekd_all) | new_padding_utterance_masked)
+            new_intra_speaker_masekd_all = (intra_speaker_masekd_all | new_padding_utterance_masked)
+
+            # intra and inter speaker dependencies  
+            i_vector = self.iq(sentence_vectors_with_convers_shape)            
             u_vector_fused_by_intra_speaker, _ = self.intra_speaker_modeling(i_vector,  i_vector,  i_vector, 
-                                                                        attn_mask=(~intra_speaker_masekd_all).repeat(8,1,1), key_padding_mask=padding_utterance_masked) 
+                                                                        attn_mask=(inter_speaker_masekd_all).repeat(8,1,1), key_padding_mask=padding_utterance_masked) 
             u_vector_fused_by_intra_speaker = u_vector_fused_by_intra_speaker.reshape(n_conversation*len_longest_conversation, -1)
 
             a_vector = self.aq(sentence_vectors_with_convers_shape)
             u_vector_fused_by_inter_speaker, _ = self.inter_speaker_modeling(a_vector,  a_vector,  a_vector, 
-                                                                        attn_mask=intra_speaker_masekd_all.repeat(8,1,1), key_padding_mask=padding_utterance_masked)
+                                                                        attn_mask=new_intra_speaker_masekd_all.repeat(8,1,1), key_padding_mask=padding_utterance_masked)
             u_vector_fused_by_inter_speaker = u_vector_fused_by_inter_speaker.reshape(n_conversation*len_longest_conversation, -1)
             
             y_hat = y_hat + self.output_layer_intra(self.dropout_layer(u_vector_fused_by_intra_speaker)) + self.output_layer_inter(self.dropout_layer(u_vector_fused_by_inter_speaker))
-
-            # utterance_vector_fused_by_speaker_history = sentence_vectors_with_convers_shape + 0 # for create a new tensor equal to output bert vector`fake_utterance_vector_from_bert
-            #                                                                                     # original utterance vector list 
-            # for i_conversation in range(intra_speaker_masekd_all.shape[0]):
-            #     # process for each conversation in batch data.
-
-            #     # compute the intra-masked for each speaker
-            #     intra_speaker_masked_all_users_one_conversation = torch.unique(intra_speaker_masekd_all[i_conversation], dim=0)
-            #     n_speaker = intra_speaker_masked_all_users_one_conversation.shape[0]
-
-            #     # get maximum the number of utterance for each speaker 
-            #     n_utterance_each_speaker = []
-            #     v_utterance_each_speaker = []
-            #     for i_speaker in range(n_speaker):
-            #         i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
-            #         v_i_speaker = sentence_vectors_with_convers_shape[i_conversation][i_speaker_mask]
-            #         n_utterance_each_speaker.append(v_i_speaker.shape[0])
-            #         v_utterance_each_speaker.append(v_i_speaker)
-            #     max_n_utterance_each_speaker = max(n_utterance_each_speaker)
-
-            #     # intra-padding for each speaker 
-            #     for i_speaker in range(n_speaker):
-            #         if n_utterance_each_speaker[i_speaker] < max_n_utterance_each_speaker:
-            #             v_utterance_each_speaker[i_speaker] = F.pad(v_utterance_each_speaker[i_speaker], [0, 0, 0, max_n_utterance_each_speaker-n_utterance_each_speaker[i_speaker]])
-                        
-            #     tensor_all_speakers = torch.stack(v_utterance_each_speaker, dim=0)
-                
-            #     # learn intra speaker information based on sequence model 
-            #     # h_words, (hn, cn) = self.speaker_history_model_by_lstm(v_all_speakers)                                        # for lstm architecture 
-            #     h_words = self.intra_speaker_context(tensor_all_speakers+self.pos_encoding(tensor_all_speakers))         # for transformer architecture 
-
-            #     # put the intra information back to original utterance vector list 
-
-            #     for i_speaker in range(n_speaker):
-            #         i_speaker_mask = intra_speaker_masked_all_users_one_conversation[i_speaker]
-            #         utterance_vector_fused_by_speaker_history[i_conversation][i_speaker_mask] += h_words[i_speaker][:n_utterance_each_speaker[i_speaker]]
-    
-            # utterance_vector_fused_by_speaker_history = utterance_vector_fused_by_speaker_history.reshape(batch_size*len_longest_conversation, -1)
-
-            # combine intra speaker context 
-            # y_hat = y_hat + self.output_layer_intra(self.dropout_layer(utterance_vector_fused_by_speaker_history))
 
         # 
         # compute probabilities and loss 
@@ -461,9 +486,10 @@ if __name__ == "__main__":
     parser.add_argument("--sent_aggregate_method", help="sent_aggregate_method in  {average, cls, lstm, mlp}", type=str, default="average")
     parser.add_argument("--data_name_pattern", help="data_name_pattern", type=str, default="iemocap.{}window2.json")
     parser.add_argument("--log_dir", help="path of data log dir and trained model. This path is augmented by {dataset_name}", type=str, default="./trained_models")
-    parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="cardiffnlp/twitter-roberta-base-sentiment")
+    parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="roberta-large")
     parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=10)
     parser.add_argument("--intra_speaker_context", help="use information of intra speaker context", action="store_true", default=False)
+    parser.add_argument("--window_ct", help="number of context window", type=int, default=5)
     options = parser.parse_args()
 
 
@@ -475,10 +501,10 @@ if __name__ == "__main__":
     # Label counting
     dataset_name = options.data_name_pattern.split(".")[0]
     data_name_pattern = options.data_name_pattern
-    train_data = json.load(open(f'{options.data_folder}/{data_name_pattern.format("train")}'))
+    train_data = BatchPreprocessor.load_raw_data(f'{options.data_folder}/{data_name_pattern.format("train")}')
     all_labels = []
     for sample in train_data:
-        all_labels+=  sample['labels']
+        all_labels += sample['labels']
     # count label 
     options.num_labels = len(set(all_labels))
 
@@ -501,10 +527,10 @@ if __name__ == "__main__":
     
     batch_size = options.batch_size
     bert_tokenizer = AutoTokenizer.from_pretrained(model_configs.pre_trained_model_name)
-    data_loader = BatchPreprocessor(bert_tokenizer)
-    train_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('train')}")), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=True)
-    valid_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('valid')}")), batch_size=1, collate_fn=data_loader, shuffle=False)
-    test_loader = DataLoader(json.load(open(f"{options.data_folder}/{data_name_pattern.format('test')}")), batch_size=1, collate_fn=data_loader, shuffle=False)
+    data_loader = BatchPreprocessor(bert_tokenizer, dataset_name=dataset_name, window_ct=options.window_ct)
+    train_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('train')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=True)
+    valid_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('valid')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=False)
+    test_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('test')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=False)
 
     for e in test_loader:
         print('First epoch data:')
