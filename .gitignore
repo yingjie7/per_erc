@@ -4,3 +4,9 @@
 env_py38
 env_py38/
 trained_models/
+libs/
+**.csv
+**/lightning_logs/
+**/__pycache__/
+**.pdf
+**.zip

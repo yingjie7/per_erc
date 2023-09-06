@@ -1,3 +1,4 @@
+import collections
 from os import path
 import os
 import torch
@@ -51,6 +52,7 @@ class BatchPreprocessor(object):
     @staticmethod
     def get_speaker_name(s_id, gender, data_name):
         if data_name == "iemocap":
+            # iemocap: label index mapping = {'hap':0, 'sad':1, 'neu':2, 'ang':3, 'exc':4, 'fru':5}
             speaker = {
                         "Ses01": {"F": "Mary", "M": "James"},
                         "Ses02": {"F": "Patricia", "M": "John"},
@@ -61,9 +63,12 @@ class BatchPreprocessor(object):
             s_id_first_part = s_id[:5]
             return speaker[s_id_first_part][gender].upper()
         elif data_name in ['meld', "emorynlp"]:
+            # emorynlp: label index mapping =  {'Joyful': 0, 'Mad': 1, 'Peaceful': 2, 'Neutral': 3, 'Sad': 4, 'Powerful': 5, 'Scared': 6}
+            # meld: label index mapping = {'neutral': 0, 'surprise': 1, 'fear': 2, 'sadness': 3, 'joy': 4, 'disgust': 5, 'anger':6}
             gender_idx = gender.index(1) 
             return f"SPEAKER_{gender_idx}"
         elif data_name=='dailydialog':
+            # dailydialog:  {'no_emotion': 0, 'happiness': 1, 'sadness': 2, 'surprise': 3,  'anger': 4, 'fear': 5, 'disgust':6}
             return f"SPEAKER_{gender}"
         
     def sentence_mixed_by_surrounding(self, sentences, around_window, s_id, genders, data_name):
@@ -342,7 +347,7 @@ class EmotionClassifier(pl.LightningModule):
 
         # 
         #  intra speaker modeling 
-        if model_configs.intra_speaker_context:
+        if self.model_configs.intra_speaker_context:
 
             # padding for masked utterance
             new_padding_utterance_masked = padding_utterance_masked.unsqueeze(-1).repeat(1,1,intra_speaker_masekd_all.shape[-1])
@@ -504,14 +509,14 @@ if __name__ == "__main__":
     train_data = BatchPreprocessor.load_raw_data(f'{options.data_folder}/{data_name_pattern.format("train")}')
     all_labels = []
     for sample in train_data:
-        all_labels += sample['labels']
+        all_labels += [e for e in sample['labels'] if e != -1]
     # count label 
     options.num_labels = len(set(all_labels))
 
     # compute class weight - for imbalance data 
     # class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(np.array(all_labels)), y=np.array(all_labels))
     unique = list(np.unique(np.array(all_labels)))
-    labels_dict = dict([(i, e) for i, e in enumerate(list(np.bincount(np.array(all_labels))))])
+    labels_dict = collections.Counter(all_labels)
     total = np.sum(list(labels_dict.values()))
     weights = []
     for key in unique:
