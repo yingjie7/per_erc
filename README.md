@@ -16,7 +16,6 @@ Therefore, in this paper, we investigate the effect of accumulating word vector 
 | DialogueEIN                                     |  **68.93**  |    38.92     |   65.37   |      62.58      |     |
 | COSMIC <sup>\*</sup>                            |    65.28    |    38.11     |   65.21   |      58.48      |     |
 | SKIER <sup>\*</sup>                             |     \-      |  **40.07**   | **67.39** |      62.31      |     |
-|
 | AccumWR (ours)                                  |             |              |           |                 |     |
 | \- using <span class="smallcaps">mlp</span>     |    67.65    |    39.33     |   64.58   |      59.22      |     |
 | \- using <span class="smallcaps">average</span> |    67.78    |    38.21     |   64.99   |      59.40      |     |
@@ -27,6 +26,7 @@ this work. The mark *star* (<sup>\*</sup>) indicates that these works
 used external knowledge or additional data.
 
 ##  Data  
+unzip the file `data.zip` to extract data.
 - IEMOCAP
     Data structure examples: 
     ```json
