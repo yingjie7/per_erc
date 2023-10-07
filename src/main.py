@@ -1,6 +1,8 @@
 import collections
 from os import path
 import os
+import pickle
+from torch.nn import functional as F
 import torch
 import numpy as np
 from torch import nn
@@ -30,11 +32,24 @@ def set_random_seed(seed: int):
     torch.backends.cudnn.benchmark = False
     
 class BatchPreprocessor(object): 
-    def __init__(self, tokenizer, dataset_name=None, window_ct=2) -> None:
+    def __init__(self, tokenizer, model_configs=None, data_type='valid') -> None:
         self.tokenizer = tokenizer
         self.separate_token_id = self.tokenizer.convert_tokens_to_ids("</s>")
-        self.dataset_name  = dataset_name
-        self.window_ct = window_ct
+        self.dataset_name  =  model_configs.data_name_pattern.split(".")[0]
+        self.window_ct = model_configs.window_ct
+        self.model_configs = model_configs
+        
+        if model_configs.llm_context:
+            path_llm_context_vect=f'{model_configs.data_folder}/llm_vectors/{model_configs.llm_context_file_pattern.format(data_type)}'
+            self.llm_context_vect = pickle.load(open(path_llm_context_vect, 'rb'))
+            
+            check_key = list(self.llm_context_vect.keys())[0]
+            self.llm_context_vect_dim = self.llm_context_vect[check_key][0].shape[-1]
+            
+        if model_configs.speaker_description:
+            path_file = f'{model_configs.data_folder}/llm_vectors/{model_configs.speaker_description_file_pattern.format(data_type)}'
+            self.speaker_description = json.load(open(path_file, 'rt'))
+            
     
     @staticmethod
     def load_raw_data(path_data):
@@ -47,8 +62,7 @@ class BatchPreprocessor(object):
             return new_data_list
         elif isinstance(raw_data, list):
             return raw_data
-            
-    
+              
     @staticmethod
     def get_speaker_name(s_id, gender, data_name):
         if data_name == "iemocap":
@@ -88,6 +102,7 @@ class BatchPreprocessor(object):
         raw_sentences = []
         raw_sentences_flatten = []
         labels = []
+        llm_context_vectors = []
 
         # masked tensor  
         lengths = [len(sample['sentences']) for sample in batch]
@@ -103,7 +118,6 @@ class BatchPreprocessor(object):
                                                                         s_id=sample['s_id'], 
                                                                         genders=sample['genders'],
                                                                         data_name=self.dataset_name)
-        
             # conversation padding 
             padded_conversation = sentences_mixed_arround + ["<pad_sentence>"]* (max_len_conversation - lengths[i])
             raw_sentences.append(padded_conversation)
@@ -128,26 +142,64 @@ class BatchPreprocessor(object):
 
         if len(labels)!= len(raw_sentences_flatten):
             print('len(labels)!= len(raw_sentences_flatten)')
-
+        
+        raw_sentences_flatten_spdesc = raw_sentences_flatten + []
+        n_spdesc = 0
+        
+        # ======== 
+        # setting for using speaker description 
+        sp_characteristic_word_ids = None
+        if self.model_configs.speaker_description:    
+            speaker_descriptions = []
+            for i, sample in enumerate(batch):
+                speaker_descriptions += self.speaker_description[sample['s_id']] 
+            all_speaker_descriptions = list(set(speaker_descriptions))
+            n_spdesc = len(all_speaker_descriptions)
+            raw_sentences_flatten_spdesc = all_speaker_descriptions + raw_sentences_flatten
+            
+            all_speaker_descriptions_idx = [all_speaker_descriptions.index(e) for e in speaker_descriptions]
+            sp_characteristic_word_ids = {'len_sp_desc': len(all_speaker_descriptions), 'all_speaker_descriptions': all_speaker_descriptions_idx}
+        # ======== 
+        
         # utterance vectorizer
         # v_single_sentences = self._encoding(sample['sentences'])
-        contextual_sentences_ids = self.tokenizer(raw_sentences_flatten,  padding='longest', max_length=512, truncation=True, return_tensors='pt')
-        sent_indices, word_indices = torch.where(contextual_sentences_ids['input_ids'] == self.separate_token_id)
+        contextual_sentences_ids = self.tokenizer(raw_sentences_flatten_spdesc,  padding='longest', max_length=512, truncation=True, return_tensors='pt')
+        sent_indices, word_indices = torch.where(contextual_sentences_ids['input_ids'][n_spdesc:] == self.separate_token_id)
         gr_sent_indices = [[] for e in range(len(raw_sentences_flatten))]
         for sent_idx, w_idx in zip (sent_indices, word_indices):
             gr_sent_indices[sent_idx].append(w_idx.item())
             
-        cur_sentence_indexes_masked = torch.BoolTensor(contextual_sentences_ids['input_ids'].shape).fill_(False)
-        for i in range(contextual_sentences_ids['input_ids'].shape[0]):
+        cur_sentence_indexes_masked = torch.BoolTensor(contextual_sentences_ids['input_ids'][n_spdesc:].shape).fill_(False)
+        for i in range(contextual_sentences_ids['input_ids'][n_spdesc:].shape[0]):
             if raw_sentences_flatten[i] =='<pad_sentence>':
                 cur_sentence_indexes_masked[i][gr_sent_indices[i][0]] = True
                 continue
-            for j in range(contextual_sentences_ids['input_ids'].shape[1]):
+            for j in range(contextual_sentences_ids['input_ids'][n_spdesc:].shape[1]):
                 if  gr_sent_indices[i][0] <= j <= gr_sent_indices[i][1]:
                     cur_sentence_indexes_masked[i][j] = True
-
-        return (contextual_sentences_ids, torch.LongTensor(labels), padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences) 
-
+                    
+        padding_word_masked = None
+        llm_context_vectors = []
+        if self.model_configs.llm_context:
+            for i, sample in enumerate(batch):
+                for s in range(len(sample['sentences'])):
+                    llm_context_vectors.append(self.llm_context_vect[sample['s_id']][s])
+            llm_context_vectors  = [e.to(torch.float) for e in llm_context_vectors]
+            
+            if self.model_configs.llm_aggregate_method == 'accwr_selfattn':
+                max_sent_len  = max([e.shape[0] for e in llm_context_vectors])
+                padding_word_masked = torch.BoolTensor([[False]*e.shape[0]+ [True]*(max_sent_len - e.shape[0]) for e in llm_context_vectors])
+                llm_context_vectors  = torch.stack([F.pad(e, (0,0,0,max_sent_len - e.shape[0]), "constant", 0)   for e in llm_context_vectors], dim=0)
+            elif self.model_configs.llm_aggregate_method == 'accwr_average':
+                llm_context_vectors  = [torch.sum(e, dim=0) / e.shape[0] for e in llm_context_vectors]
+                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
+            elif self.model_configs.llm_aggregate_method == 'cls':
+                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
+        
+            llm_context_vectors.requires_grad = False
+        
+        return (contextual_sentences_ids, torch.LongTensor(labels), padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, 
+                llm_context_vectors, padding_word_masked, sp_characteristic_word_ids, raw_sentences) 
 
 class BertSelfAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout, batch_first=True):
@@ -251,11 +303,11 @@ class EmotionClassifier(pl.LightningModule):
         self.context_modeling = nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True), num_layers=num_layer)  # using transformer model in here 
         self.pos_encoding = PositionalEncoding(d_model)  # position encoding => for utterance positions (e.g., u_1, u_2, ...) in conversation. 
         
+
         if model_configs.intra_speaker_context:
             # intra speaker modeling 
             # self.intra_speaker_context  =nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True), num_layers=num_layer)
             # self.output_layer_intra = nn.Linear(d_model, model_configs.num_labels)
-
             self.intra_speaker_modeling =  BertSelfAttention(int(d_model/2), num_heads=nhead, dropout=model_configs.dropout, batch_first=True)    
             self.iq =   nn.Linear(d_model, int(d_model/2))   
             self.output_layer_intra = nn.Linear(int(d_model/2), model_configs.num_labels)
@@ -268,6 +320,20 @@ class EmotionClassifier(pl.LightningModule):
         self.dropout_layer = nn.Dropout(model_configs.dropout)
 
         # output layer 
+        if model_configs.llm_context:
+            # llm modeling
+            llm_model = model_configs.llm_context_vect_dim
+            if model_configs.llm_aggregate_method == 'accwr_selfattn':
+                self.llm_attention_modeling = nn.MultiheadAttention(llm_model, num_heads=8, dropout=0.2, batch_first=True )
+                self.llm_query = nn.Linear(llm_model,int(llm_model))
+                self.llm_key = nn.Linear(llm_model,int(llm_model))
+                self.llm_value = nn.Linear(llm_model,int(llm_model))
+            self.output_llm_context = nn.Linear(llm_model, model_configs.num_labels)
+        
+        if model_configs.speaker_description:
+            self.output_layer_sp_description= nn.Linear(d_model, model_configs.num_labels)
+            
+            
         self.output_layer_context = nn.Linear(d_model, model_configs.num_labels)
         self.output_layer = nn.Linear(d_model, model_configs.num_labels)
 
@@ -322,7 +388,7 @@ class EmotionClassifier(pl.LightningModule):
             return sentence_vectors
 
     def training_step(self, batch, batch_idx, return_y_hat=False):
-        input_ids, labels, padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, raw_sentences = batch
+        input_ids, labels, padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, llm_context_vectors,padding_word_masked, sp_description_word_ids, raw_sentences = batch
         n_conversation, len_longest_conversation = padding_utterance_masked.shape[0], padding_utterance_masked.shape[1]
         
         # 
@@ -330,22 +396,24 @@ class EmotionClassifier(pl.LightningModule):
         # bert_out[0]: hidden states of `all words` for each sentence 
         # bert_out[1]: hidden states of `cls token` for each sentence
         bert_out = self.model(**input_ids)
+        
+        n_speaker_description = 0 
+        if model_configs.speaker_description:
+            all_speaker_descriptions = sp_description_word_ids['all_speaker_descriptions']
+            n_speaker_description = sp_description_word_ids['len_sp_desc']
+            sp_description_vector = bert_out.pooler_output [:n_speaker_description]
 
-        # 
         # construct sentence vector based on word representations  
-        sentence_vectors = self.aggregate_sentence_h_state(bert_out.pooler_output, bert_out.last_hidden_state, cur_sentence_indexes_masked)
+        sentence_vectors = self.aggregate_sentence_h_state(bert_out.pooler_output[n_speaker_description:], bert_out.last_hidden_state[n_speaker_description:], cur_sentence_indexes_masked)
         sentence_vectors_with_convers_shape = sentence_vectors.reshape(n_conversation, len_longest_conversation, -1)
 
-        # 
         # learn global relationship 
         u_vector_fused_by_context = self.context_modeling(sentence_vectors_with_convers_shape +  self.pos_encoding(sentence_vectors_with_convers_shape), src_key_padding_mask=padding_utterance_masked)
         u_vector_fused_by_context = u_vector_fused_by_context.reshape(n_conversation*len_longest_conversation, -1)
         
-        # 
         # combine global context (u_vector_fused_by_context) and local context (sentence_vectors)
         y_hat = self.output_layer_context(self.dropout_layer(u_vector_fused_by_context)) + self.output_layer(self.dropout_layer(sentence_vectors))
 
-        # 
         #  intra speaker modeling 
         if self.model_configs.intra_speaker_context:
 
@@ -370,8 +438,26 @@ class EmotionClassifier(pl.LightningModule):
             u_vector_fused_by_inter_speaker, _ = self.inter_speaker_modeling(a_vector,  a_vector,  a_vector, 
                                                                         attn_mask=new_intra_speaker_masekd_all.repeat(8,1,1), key_padding_mask=padding_utterance_masked)
             u_vector_fused_by_inter_speaker = u_vector_fused_by_inter_speaker.reshape(n_conversation*len_longest_conversation, -1)
-            
+
             y_hat = y_hat + self.output_layer_intra(self.dropout_layer(u_vector_fused_by_intra_speaker)) + self.output_layer_inter(self.dropout_layer(u_vector_fused_by_inter_speaker))
+
+        if model_configs.llm_context:
+            # llm self_attention modeling
+            if model_configs.llm_aggregate_method == 'accwr_selfattn':
+                llm_vectors_with_attention, attentions = self.llm_attention_modeling(self.llm_query(llm_context_vectors),
+                                                                                    self.llm_key(llm_context_vectors),
+                                                                                    self.llm_value(llm_context_vectors),
+                                                                                    key_padding_mask=padding_word_masked
+                                                                                    )
+                llm_vectors_with_attention.masked_fill_(padding_word_masked.unsqueeze(-1), 0)
+                llm_vectors_with_attention = torch.sum(llm_vectors_with_attention, dim=1) * (1/ torch.sum(~padding_word_masked, dim=1)).unsqueeze(-1)
+                llm_context_vectors = llm_vectors_with_attention
+                
+            y_hat = y_hat + self.output_llm_context(self.dropout_layer(llm_context_vectors))
+            
+        if model_configs.speaker_description:
+            sp_description_vector_extracted = torch.stack([sp_description_vector[idx] for idx in all_speaker_descriptions], dim=0)
+            y_hat = y_hat + self.output_layer_sp_description(self.dropout_layer(sp_description_vector_extracted)) 
 
         # 
         # compute probabilities and loss 
@@ -391,7 +477,7 @@ class EmotionClassifier(pl.LightningModule):
         return out
     
     def validation_step(self, batch, batch_idx):
-        _, labels, _, _, _, _ = batch
+        labels= batch[1]
         loss, y_hat = self.training_step(batch, batch_idx, return_y_hat=True)
         _ = torch.argmax(y_hat, dim=1)
 
@@ -480,7 +566,7 @@ class EmotionClassifier(pl.LightningModule):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data_folder", help="path to data folder", type=str, default='/home/phuongnm/deeplearning_tutorial/src/SimpleNN/data/all_raw_data/') 
+    parser.add_argument("--data_folder", help="path to data folder", type=str, default='/home/s2220429/per_erc/data/all_raw_data') 
     parser.add_argument("--n_best_checkpoint", help="number of best checkpoints to save", type=int, default=1) 
     parser.add_argument("--accumulate_grad_batches", help="number of accumulate batch for each grandient update step", type=int, default=2) 
     parser.add_argument("--seed", help="seed value ", type=int, default=7) 
@@ -494,6 +580,14 @@ if __name__ == "__main__":
     parser.add_argument("--pre_trained_model_name", help="pre_trained_model_name", type=str, default="roberta-large")
     parser.add_argument("--froze_bert_layer", help="froze_bert_layer", type=int, default=10)
     parser.add_argument("--intra_speaker_context", help="use information of intra speaker context", action="store_true", default=False)
+    
+    parser.add_argument("--llm_context", help="use llm context or not",action="store_true", default=False)
+    parser.add_argument("--llm_aggregate_method", help="method to incoporate llm context vector in {cls, accwr_selfattn, accwr_average}", type=str, default="accwr_average")
+    parser.add_argument("--llm_context_file_pattern", help="llm context vector path", type=str, default='iemocap.{}_v2_5')
+    
+    parser.add_argument("--speaker_description", help="use llm context or not",action="store_true", default=False)
+    parser.add_argument("--speaker_description_file_pattern", help="speaker description path file pattern", type=str, default="iemocap.{}_speaker_descriptions.json")
+    
     parser.add_argument("--window_ct", help="number of context window", type=int, default=5)
     options = parser.parse_args()
 
@@ -532,11 +626,19 @@ if __name__ == "__main__":
     
     batch_size = options.batch_size
     bert_tokenizer = AutoTokenizer.from_pretrained(model_configs.pre_trained_model_name)
-    data_loader = BatchPreprocessor(bert_tokenizer, dataset_name=dataset_name, window_ct=options.window_ct)
-    train_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('train')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=True)
-    valid_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('valid')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=False)
-    test_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('test')}"), batch_size=model_configs.batch_size, collate_fn=data_loader, shuffle=False)
 
+    data_loader_valid = BatchPreprocessor(bert_tokenizer, model_configs=model_configs, data_type='valid')
+    valid_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('valid')}"), batch_size=model_configs.batch_size, collate_fn=data_loader_valid, shuffle=False)
+    
+    data_loader_train = BatchPreprocessor(bert_tokenizer, model_configs=model_configs, data_type='train')
+    train_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('train')}"), batch_size=model_configs.batch_size, collate_fn=data_loader_train, shuffle=True)
+    
+    data_loader_test = BatchPreprocessor(bert_tokenizer, model_configs=model_configs, data_type='test')
+    test_loader = DataLoader(BatchPreprocessor.load_raw_data(f"{options.data_folder}/{data_name_pattern.format('test')}"), batch_size=model_configs.batch_size, collate_fn=data_loader_test, shuffle=False)
+
+    if model_configs.llm_context:
+        model_configs.llm_context_vect_dim = data_loader_train.llm_context_vect_dim
+    
     for e in test_loader:
         print('First epoch data:')
         print('input data\n', e[0])
