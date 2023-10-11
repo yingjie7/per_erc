@@ -42,15 +42,37 @@ class BatchPreprocessor(object):
         if model_configs.llm_context:
             path_llm_context_vect=f'{model_configs.data_folder}/llm_vectors/{model_configs.llm_context_file_pattern.format(data_type)}'
             self.llm_context_vect = pickle.load(open(path_llm_context_vect, 'rb'))
-            
             check_key = list(self.llm_context_vect.keys())[0]
             self.llm_context_vect_dim = self.llm_context_vect[check_key][0].shape[-1]
+            
+            self.llm_context_vector_preprocess()
             
         if model_configs.speaker_description:
             path_file = f'{model_configs.data_folder}/llm_vectors/{model_configs.speaker_description_file_pattern.format(data_type)}'
             self.speaker_description = json.load(open(path_file, 'rt'))
             
-    
+    def llm_context_vector_preprocess(self):
+        all_convs = self.llm_context_vect
+        new_vect_dict = {}
+        for conv_id, conv in all_convs.items(): 
+            llm_context_vectors  = [e.to(torch.float) for e in conv]
+        
+            if self.model_configs.llm_aggregate_method == 'accwr_selfattn':
+                max_sent_len  = max([e.shape[0] for e in llm_context_vectors])
+                padding_word_masked = torch.BoolTensor([[False]*e.shape[0]+ [True]*(max_sent_len - e.shape[0]) for e in llm_context_vectors])
+                new_vect_dict[conv_id+"_padding_word_masked"] =  padding_word_masked
+                
+                llm_context_vectors  = torch.stack([F.pad(e, (0,0,0,max_sent_len - e.shape[0]), "constant", 0)   for e in llm_context_vectors], dim=0)
+            elif self.model_configs.llm_aggregate_method == 'accwr_average':
+                llm_context_vectors = [torch.sum(e, dim=0) * 1/ e.shape[0] for e in llm_context_vectors]
+                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
+            elif self.model_configs.llm_aggregate_method == 'cls':
+                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
+                
+            new_vect_dict[conv_id] =  llm_context_vectors
+            
+        self.llm_context_vect = new_vect_dict
+        
     @staticmethod
     def load_raw_data(path_data):
         raw_data = json.load(open(path_data))
@@ -178,24 +200,18 @@ class BatchPreprocessor(object):
                 if  gr_sent_indices[i][0] <= j <= gr_sent_indices[i][1]:
                     cur_sentence_indexes_masked[i][j] = True
                     
-        padding_word_masked = None
+        padding_word_masked = []
         llm_context_vectors = []
         if self.model_configs.llm_context:
-            for i, sample in enumerate(batch):
-                for s in range(len(sample['sentences'])):
-                    llm_context_vectors.append(self.llm_context_vect[sample['s_id']][s])
-            llm_context_vectors  = [e.to(torch.float) for e in llm_context_vectors]
-            
-            if self.model_configs.llm_aggregate_method == 'accwr_selfattn':
-                max_sent_len  = max([e.shape[0] for e in llm_context_vectors])
-                padding_word_masked = torch.BoolTensor([[False]*e.shape[0]+ [True]*(max_sent_len - e.shape[0]) for e in llm_context_vectors])
-                llm_context_vectors  = torch.stack([F.pad(e, (0,0,0,max_sent_len - e.shape[0]), "constant", 0)   for e in llm_context_vectors], dim=0)
-            elif self.model_configs.llm_aggregate_method == 'accwr_average':
-                llm_context_vectors  = [torch.sum(e, dim=0) / e.shape[0] for e in llm_context_vectors]
-                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
-            elif self.model_configs.llm_aggregate_method == 'cls':
-                llm_context_vectors  = torch.stack(llm_context_vectors, dim=0)
-        
+            for i, sample in enumerate(batch): 
+                llm_context_vectors.append(self.llm_context_vect[sample['s_id']] ) 
+                if model_configs.llm_aggregate_method == 'accwr_selfattn':
+                    padding_word_masked.append(self.llm_context_vect[sample['s_id']+ "_padding_word_masked"] ) 
+                    
+            if model_configs.llm_aggregate_method == 'accwr_selfattn':
+                padding_word_masked = torch.cat(padding_word_masked, dim=0)
+                
+            llm_context_vectors = torch.cat(llm_context_vectors, dim=0)
             llm_context_vectors.requires_grad = False
         
         return (contextual_sentences_ids, torch.LongTensor(labels), padding_utterance_masked, intra_speaker_masekd_all, cur_sentence_indexes_masked, 
@@ -331,6 +347,11 @@ class EmotionClassifier(pl.LightningModule):
             self.output_llm_context = nn.Linear(llm_model, model_configs.num_labels)
         
         if model_configs.speaker_description:
+            if model_configs.spdesc_aggregate_method == 'attn':
+                self.speaker_character_attention_modeling = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.2, batch_first=True )
+            elif model_configs.spdesc_aggregate_method == 'attn_linear_spdesc':
+                self.speaker_character_attention_modeling = nn.MultiheadAttention(d_model, num_heads=8, dropout=0.2, batch_first=True )
+                self.linear_spdesc = nn.Linear(d_model, d_model)
             self.output_layer_sp_description= nn.Linear(d_model, model_configs.num_labels)
             
             
@@ -457,7 +478,23 @@ class EmotionClassifier(pl.LightningModule):
             
         if model_configs.speaker_description:
             sp_description_vector_extracted = torch.stack([sp_description_vector[idx] for idx in all_speaker_descriptions], dim=0)
-            y_hat = y_hat + self.output_layer_sp_description(self.dropout_layer(sp_description_vector_extracted)) 
+            
+            # encoding charateristic emb
+            if model_configs.spdesc_aggregate_method == 'static':
+                y_hat_characteristic = sp_description_vector_extracted
+            elif model_configs.spdesc_aggregate_method == 'attn':
+                utterance_fused_by_characteristic = sentence_vectors + sp_description_vector_extracted 
+                y_hat_characteristic, _ = self.speaker_character_attention_modeling(utterance_fused_by_characteristic, 
+                                                                                sp_description_vector,
+                                                                                sp_description_vector )
+            elif model_configs.spdesc_aggregate_method == 'attn_linear_spdesc':
+                
+                utterance_fused_by_characteristic = self.linear_spdesc(sentence_vectors + sp_description_vector_extracted)
+                y_hat_characteristic, _ = self.speaker_character_attention_modeling(utterance_fused_by_characteristic, 
+                                                                                sp_description_vector,
+                                                                                sp_description_vector )
+            
+            y_hat = y_hat + self.output_layer_sp_description(self.dropout_layer(y_hat_characteristic))
 
         # 
         # compute probabilities and loss 
@@ -586,6 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--llm_context_file_pattern", help="llm context vector path", type=str, default='iemocap.{}_v2_5')
     
     parser.add_argument("--speaker_description", help="use llm context or not",action="store_true", default=False)
+    parser.add_argument("--spdesc_aggregate_method", help="method to incoporate llm context vector in {static, attn}", type=str, default="static")
     parser.add_argument("--speaker_description_file_pattern", help="speaker description path file pattern", type=str, default="iemocap.{}_speaker_descriptions.json")
     
     parser.add_argument("--window_ct", help="number of context window", type=int, default=5)
@@ -673,6 +711,7 @@ if __name__ == "__main__":
                         )
     
     # init model 
+    print(model_configs)
     model = EmotionClassifier(model_configs)
     
     # train
