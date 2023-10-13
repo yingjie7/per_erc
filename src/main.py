@@ -606,6 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_folder", help="path to data folder", type=str, default='/home/s2220429/per_erc/data/all_raw_data') 
     parser.add_argument("--n_best_checkpoint", help="number of best checkpoints to save", type=int, default=1) 
     parser.add_argument("--accumulate_grad_batches", help="number of accumulate batch for each grandient update step", type=int, default=2) 
+    parser.add_argument("--precision", help="precision of computation tensor operators which selected in {32-true, 16-mixed} ", type=str, default="32-true") 
     parser.add_argument("--seed", help="seed value ", type=int, default=7) 
     parser.add_argument("--batch_size", help="batch ", type=int, default=1) 
     parser.add_argument("--dropout", help="dropout", type=float, default=0.2)
@@ -623,7 +624,8 @@ if __name__ == "__main__":
     parser.add_argument("--llm_context_file_pattern", help="llm context vector path", type=str, default='iemocap.{}_v2_5')
     
     parser.add_argument("--speaker_description", help="use llm context or not",action="store_true", default=False)
-    parser.add_argument("--spdesc_aggregate_method", help="method to incoporate llm context vector in {static, attn}", type=str, default="static")
+    parser.add_argument("--spdesc_aggregate_method", help="method to incoporate speaker vector in {static, attn}", type=str, default="static")
+    parser.add_argument("--spdesc_enc", help="method to encode speaker description  {roberta, lstm}", type=str, default="roberta")
     parser.add_argument("--speaker_description_file_pattern", help="speaker description path file pattern", type=str, default="iemocap.{}_speaker_descriptions.json")
     
     parser.add_argument("--window_ct", help="number of context window", type=int, default=5)
@@ -703,7 +705,7 @@ if __name__ == "__main__":
     # init trainer 
     lr_monitor = LearningRateMonitor(logging_interval='step')
     trainer = Trainer(max_epochs=model_configs.max_ep, 
-                        accelerator="gpu", devices=1,
+                        accelerator="gpu", devices=1, precision=model_configs.precision,
                         callbacks=[checkpoint_callback, lr_monitor],
                         default_root_dir=f"{model_configs.log_dir}",
                         accumulate_grad_batches=model_configs.accumulate_grad_batches,
