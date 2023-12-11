@@ -104,5 +104,14 @@ Init python environment
     > **Note**: Please check this scripts to check the setting and choose which data you want to run. 
 
 ## Citation 
-   
-    [updating]
+   ```
+    @INPROCEEDINGS{10299463,
+      author={Jieying, Xue and Minh, Nguyen Phuong and Blake, Matheny and Minh Le, Nguyen},
+      booktitle={2023 15th International Conference on Knowledge and Systems Engineering (KSE)}, 
+      title={Accumulating Word Representations in Multi-level Context Integration for ERC Task}, 
+      year={2023},
+      volume={},
+      number={},
+      pages={1-6},
+      doi={10.1109/KSE59128.2023.10299463}}
+   ```
