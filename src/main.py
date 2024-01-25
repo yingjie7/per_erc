@@ -47,7 +47,7 @@ class BatchPreprocessor(object):
             
             self.llm_context_vector_preprocess()
             
-        if model_configs.speaker_description:
+        if self.model_configs.speaker_description:
             path_file = f'{model_configs.data_folder}/llm_vectors/{model_configs.speaker_description_file_pattern.format(data_type)}'
             self.speaker_description = json.load(open(path_file, 'rt'))
             
@@ -419,7 +419,7 @@ class EmotionClassifier(pl.LightningModule):
         bert_out = self.model(**input_ids)
         
         n_speaker_description = 0 
-        if model_configs.speaker_description:
+        if self.model_configs.speaker_description:
             all_speaker_descriptions = sp_description_word_ids['all_speaker_descriptions']
             n_speaker_description = sp_description_word_ids['len_sp_desc']
             sp_description_vector = bert_out.pooler_output [:n_speaker_description]
@@ -462,9 +462,9 @@ class EmotionClassifier(pl.LightningModule):
 
             y_hat = y_hat + self.output_layer_intra(self.dropout_layer(u_vector_fused_by_intra_speaker)) + self.output_layer_inter(self.dropout_layer(u_vector_fused_by_inter_speaker))
 
-        if model_configs.llm_context:
+        if self.model_configs.llm_context:
             # llm self_attention modeling
-            if model_configs.llm_aggregate_method == 'accwr_selfattn':
+            if self.model_configs.llm_aggregate_method == 'accwr_selfattn':
                 llm_vectors_with_attention, attentions = self.llm_attention_modeling(self.llm_query(llm_context_vectors),
                                                                                     self.llm_key(llm_context_vectors),
                                                                                     self.llm_value(llm_context_vectors),
@@ -476,18 +476,18 @@ class EmotionClassifier(pl.LightningModule):
                 
             y_hat = y_hat + self.output_llm_context(self.dropout_layer(llm_context_vectors))
             
-        if model_configs.speaker_description:
+        if self.model_configs.speaker_description:
             sp_description_vector_extracted = torch.stack([sp_description_vector[idx] for idx in all_speaker_descriptions], dim=0)
             
             # encoding charateristic emb
-            if model_configs.spdesc_aggregate_method == 'static':
+            if self.model_configs.spdesc_aggregate_method == 'static':
                 y_hat_characteristic = sp_description_vector_extracted
-            elif model_configs.spdesc_aggregate_method == 'attn':
+            elif self.model_configs.spdesc_aggregate_method == 'attn':
                 utterance_fused_by_characteristic = sentence_vectors + sp_description_vector_extracted 
                 y_hat_characteristic, _ = self.speaker_character_attention_modeling(utterance_fused_by_characteristic, 
                                                                                 sp_description_vector,
                                                                                 sp_description_vector )
-            elif model_configs.spdesc_aggregate_method == 'attn_linear_spdesc':
+            elif self.model_configs.spdesc_aggregate_method == 'attn_linear_spdesc':
                 
                 utterance_fused_by_characteristic = self.linear_spdesc(sentence_vectors + sp_description_vector_extracted)
                 y_hat_characteristic, _ = self.speaker_character_attention_modeling(utterance_fused_by_characteristic, 

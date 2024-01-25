@@ -10,3 +10,5 @@ libs/
 **/__pycache__/
 **.pdf
 **.zip
+**.ckpt
+**logs
