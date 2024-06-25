@@ -1,3 +1,8 @@
+## News!  
+Our latest results utilizing Large Language Models (LLM) can be found here:  
+[https://github.com/yingjie7/BiosERC](https://github.com/yingjie7/BiosERC)
+
+
 ## AccumWR: Accumulating Word Representations in Multi-level Context Integration for ERC Task 
 
 Emotion Recognition in Conversations (ERC) has attracted increasing attention recently because of its high applicability, which is to predict the sentiment label of each utterance given a conversation as context.    
