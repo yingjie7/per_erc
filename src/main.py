@@ -40,7 +40,7 @@ class BatchPreprocessor(object):
         self.model_configs = model_configs
         
         if model_configs.llm_context:
-            path_llm_context_vect=f'{model_configs.data_folder}/llm_vectors/{model_configs.llm_context_file_pattern.format(data_type)}'
+            path_llm_context_vect=f'{model_configs.data_folder}/{model_configs.llm_context_file_pattern.format(data_type)}'
             self.llm_context_vect = pickle.load(open(path_llm_context_vect, 'rb'))
             check_key = list(self.llm_context_vect.keys())[0]
             self.llm_context_vect_dim = self.llm_context_vect[check_key][0].shape[-1]
@@ -48,7 +48,7 @@ class BatchPreprocessor(object):
             self.llm_context_vector_preprocess()
             
         if self.model_configs.speaker_description:
-            path_file = f'{model_configs.data_folder}/llm_vectors/{model_configs.speaker_description_file_pattern.format(data_type)}'
+            path_file = f'{model_configs.data_folder}/{model_configs.speaker_description_file_pattern.format(data_type)}'
             self.speaker_description = json.load(open(path_file, 'rt'))
             
     def llm_context_vector_preprocess(self):
